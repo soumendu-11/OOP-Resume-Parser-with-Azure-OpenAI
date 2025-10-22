@@ -1,26 +1,15 @@
 """
-Resume Parsing Framework using Azure OpenAI
+Resume Parsing Framework using Azure OpenAI (Prompt-based extraction)
 
-This module provides an extensible OOP-based architecture to parse resumes (PDF/DOCX),
-extract structured text, and identify fields such as Name, Email, and Skills using Azure OpenAI.
-
-Implements:
-- Parser abstraction for PDF and Word
-- Field extractor abstraction for specific resume fields
-- ResumeData class for encapsulating extracted information
-- ResumeExtractor orchestrator to manage field extraction
-- ResumeParserFramework to combine file parsing and LLM-based field extraction
-
-Author: Soumendu Sekhar Bhattacharjee
-Date: 2025-10-22
+This module extracts structured resume information purely using Azure OpenAI prompts.
 """
 
 # =========================
 # Imports
 # =========================
 import os
-import re
 import json
+import re
 import fitz
 import docx
 from abc import ABC, abstractmethod
@@ -50,23 +39,67 @@ client = AzureOpenAI(
 
 
 # =========================
+# Prompts
+# =========================
+CV_PARSER_PROMPT = """
+You are an expert CV parser. Extract all structured information from the given CV text.
+Output the data in clear markdown sections as shown below:
+
+### Personal Information
+- Name:
+- Email:
+- Phone:
+- Location:
+- LinkedIn / GitHub (if any):
+
+### Education
+| Degree | Institution | Year | Major/Field |
+|---------|--------------|------|--------------|
+
+### Work Experience
+| Job Title | Company | Duration | Key Responsibilities |
+|------------|----------|-----------|-----------------------|
+
+### Skills
+- Technical Skills:
+- Soft Skills:
+
+### Certifications (if available)
+| Certification | Organization | Year |
+
+### Projects (if mentioned)
+| Project | Description | Tools Used |
+
+### Additional Information
+[Any extra relevant details found in the CV]
+
+**Note:** Preserve all tables in correct markdown format. Do not hallucinate or guess missing data.
+"""
+
+EXTRACTION_PROMPT = """
+You are an expert resume parser.
+Extract ONLY the following fields from the resume text and return a valid JSON object strictly in this format:
+
+{
+  "name": string,
+  "email": string,
+  "skills": [string]
+}
+
+Rules:
+- "name" should be the person's full name (if multiple found, choose the most likely).
+- "email" should be a valid email address.
+- "skills" should be a list of key skills (technical or soft skills).
+- Do not add any explanations or extra text — only return pure JSON.
+"""
+
+
+# =========================
 # Abstract Base Classes
 # =========================
 class FileParser(ABC):
-    """Abstract base class for file parsers."""
-
     @abstractmethod
     def extract_text(self, file_path: str) -> str:
-        """Extract text from the provided file path."""
-        pass
-
-
-class FieldExtractor(ABC):
-    """Abstract base class for field extractors."""
-
-    @abstractmethod
-    def extract(self, text: str, client: AzureOpenAI, deployment_name: str) -> str:
-        """Extract a specific field from resume text using Azure OpenAI."""
         pass
 
 
@@ -74,8 +107,6 @@ class FieldExtractor(ABC):
 # Concrete File Parsers
 # =========================
 class PDFParser(FileParser):
-    """Concrete parser for extracting text from PDF files."""
-
     def extract_text(self, file_path: str) -> str:
         text = ""
         doc = fitz.open(file_path)
@@ -86,12 +117,9 @@ class PDFParser(FileParser):
 
 
 class WordParser(FileParser):
-    """Concrete parser for extracting text from Word (.docx) files."""
-
     def extract_text(self, file_path: str) -> str:
         doc = docx.Document(file_path)
-        full_text = [para.text for para in doc.paragraphs]
-        return "\n".join(full_text).strip()
+        return "\n".join([para.text for para in doc.paragraphs]).strip()
 
 
 # =========================
@@ -99,113 +127,71 @@ class WordParser(FileParser):
 # =========================
 @dataclass
 class ResumeData:
-    """Data class encapsulating extracted resume fields."""
     name: str
     email: str
     skills: list
 
 
 # =========================
-# Concrete Field Extractors
+# Azure-based Field Extractor
 # =========================
-class NameExtractor(FieldExtractor):
-    """Extractor for candidate name."""
+class AzureFieldExtractor:
+    """
+    Uses Azure OpenAI to extract structured JSON from resume text using prompts.
+    """
 
-    def extract(self, text: str, client: AzureOpenAI, deployment_name: str) -> str:
-        prompt = f"Extract the candidate's full name from this resume text:\n\n{text}\n\nOnly return the name."
-        response = client.chat.completions.create(
-            model=deployment_name,
+    def __init__(self, client, deployment_name):
+        self.client = client
+        self.deployment_name = deployment_name
+
+    def parse_markdown(self, text: str) -> str:
+        """Optional: Generate structured CV in markdown using CV_PARSER_PROMPT."""
+        prompt = CV_PARSER_PROMPT + f"\n\nResume Text:\n{text}"
+        response = self.client.chat.completions.create(
+            model=self.deployment_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
         return response.choices[0].message.content.strip()
 
-
-class EmailExtractor(FieldExtractor):
-    """Extractor for email address."""
-
-    def extract(self, text: str, client: AzureOpenAI, deployment_name: str) -> str:
-        match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-        return match.group(0) if match else None
-
-
-class SkillsExtractor(FieldExtractor):
-    """Extractor for skills using Azure OpenAI."""
-
-    def extract(self, text: str, client: AzureOpenAI, deployment_name: str) -> list:
-        prompt = f"""
-        Extract a list of technical and soft skills from this resume text.
-        Return only a JSON array of skills. Example: ["Python", "Machine Learning", "Leadership"]
-        Text:
-        {text}
-        """
-        response = client.chat.completions.create(
-            model=deployment_name,
+    def extract_json_fields(self, text: str) -> ResumeData:
+        """Extract only name, email, and skills as JSON using EXTRACTION_PROMPT with robust parsing."""
+        prompt = EXTRACTION_PROMPT + f"\n\nResume Text:\n{text}"
+        response = self.client.chat.completions.create(
+            model=self.deployment_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
         content = response.choices[0].message.content.strip()
 
+        # Extract JSON object from response
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not match:
+            raise ValueError(f"No JSON object found in Azure response:\n{content}")
+
         try:
-            skills = json.loads(content)
-            if isinstance(skills, list):
-                return skills
+            data = json.loads(match.group(0))
+            return ResumeData(
+                name=data.get("name", ""),
+                email=data.get("email", ""),
+                skills=data.get("skills", [])
+            )
         except json.JSONDecodeError:
-            # fallback regex if JSON fails
-            skills = re.findall(r'\b[A-Z][a-zA-Z0-9+\-# ]{2,}\b', content)
-        return skills or []
-
-
-# =========================
-# ResumeExtractor Orchestrator
-# =========================
-class ResumeExtractor:
-    """Coordinates extraction for all resume fields using provided field extractors."""
-
-    def __init__(self, extractors: dict):
-        """
-        Initialize with a dictionary of extractors.
-        Example:
-            extractors = {
-                "name": NameExtractor(),
-                "email": EmailExtractor(),
-                "skills": SkillsExtractor()
-            }
-        """
-        self.extractors = extractors
-
-    def extract_all(self, text: str, client: AzureOpenAI, deployment_name: str) -> ResumeData:
-        """Run all extractors and return a ResumeData instance."""
-        name = self.extractors["name"].extract(text, client, deployment_name)
-        email = self.extractors["email"].extract(text, client, deployment_name)
-        skills = self.extractors["skills"].extract(text, client, deployment_name)
-        return ResumeData(name=name, email=email, skills=skills)
+            raise ValueError(f"Failed to parse JSON from Azure response:\n{content}")
 
 
 # =========================
 # ResumeParserFramework
 # =========================
 class ResumeParserFramework:
-    """
-    Orchestrates file parsing and resume field extraction.
-
-    Provides a single interface:
-        parse_resume(file_path: str) -> ResumeData
-    """
-
     def __init__(self):
         self.parsers = {
             ".pdf": PDFParser(),
             ".docx": WordParser()
         }
-        self.extractor = ResumeExtractor({
-            "name": NameExtractor(),
-            "email": EmailExtractor(),
-            "skills": SkillsExtractor()
-        })
+        self.extractor = AzureFieldExtractor(client, deployment_name)
 
     def parse_resume(self, file_path: str) -> ResumeData:
-        """Identify file type, parse text, and extract structured resume data."""
         _, ext = os.path.splitext(file_path)
         parser = self.parsers.get(ext.lower())
 
@@ -216,7 +202,11 @@ class ResumeParserFramework:
         if not text.strip():
             raise ValueError(f"Empty text extracted from: {file_path}")
 
-        resume_data = self.extractor.extract_all(text, client, deployment_name)
+        # Optional: structured markdown version (not used in JSON extraction)
+        _ = self.extractor.parse_markdown(text)
+
+        # Extract final JSON fields
+        resume_data = self.extractor.extract_json_fields(text)
         return resume_data
 
 
