@@ -21,7 +21,9 @@ This project provides a modular, object-oriented framework to parse resumes in P
 ```bash
 git clone https://github.com/your-username/oop-resume-parser.git
 cd oop-resume-parser
-
+```
+```
 2. Install required dependencies:
 
 pip install -r requirements.txt
+```
