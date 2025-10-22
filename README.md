@@ -29,8 +29,12 @@ cd oop-resume-parser
 ```
 
 2. Install required dependencies:
-```
+- **Python 3.11.5** (main, Sep 11 2023, Clang 14.0.6)
+- Libraries:
+
+```bash
 pip install -r requirements.txt
+
 ```
 3. Run the parser:
 ```
