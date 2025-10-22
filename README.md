@@ -27,3 +27,8 @@ cd oop-resume-parser
 ```
 pip install -r requirements.txt
 ```
+3. Run the parser:
+```
+python final_code_v1.py
+
+```
