@@ -1,18 +1,23 @@
-# OOP Resume Parser with Azure OpenAI
+# Resume Parsing Framework using Azure OpenAI
 
-This project provides a modular, object-oriented framework to parse resumes in PDF or DOCX formats and extract structured information such as **Name**, **Email**, and **Skills** using **Azure OpenAI** (GPT-4o or similar). The framework is designed for scalability, extensibility, and maintainability.
+This project provides an **extensible, prompt-driven resume parsing framework** using **Azure OpenAI (GPT-4o)**. It parses resumes in PDF or DOCX format, extracts structured information such as **Name**, **Email**, and **Skills**, and outputs the results as JSON files.
 
 ---
 
 ## Features
 
-- **Parser Abstraction**: Easily extendable file parsers for PDF, Word, and more.
-- **Field Extractor Abstraction**: Extract fields like Name, Email, and Skills individually.
-- **ResumeData Class**: Encapsulates all extracted fields into a structured dataclass.
-- **Resume Extraction Coordinator**: Orchestrates field extraction for accurate structured output.
-- **Framework Orchestration**: Combines file parsing and field extraction with a single interface.
+- Parse **PDF** and **Word (.docx)** resumes.
+- Extract key fields:
+  - `name`
+  - `email`
+  - `skills`
+- Optional: Generate full structured CV in **Markdown** format.
+- Fully **prompt-driven** using Azure OpenAI; **no regex used**.
+- Robust JSON parsing to handle minor formatting inconsistencies.
+- Deterministic results using `temperature=0`.
 
 ---
+
 
 ## Installation
 
