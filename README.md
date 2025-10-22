@@ -18,8 +18,8 @@ This project provides an **extensible, prompt-driven resume parsing framework** 
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/your-username/oop-resume-parser.git
-cd oop-resume-parser
+git clone https://github.com/soumendu-11/OOP-Resume-Parser-with-Azure-OpenAI.git
+cd OOP-Resume-Parser-with-Azure-OpenAI
 ```
 
 2. Install required dependencies:
