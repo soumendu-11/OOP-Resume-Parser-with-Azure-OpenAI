@@ -1,5 +1,9 @@
+os
+base64
 PyMuPDF==1.25.1
 python-docx==1.2.0
 python-dotenv==1.0.1
-langchain_openai==0.3.16
+time
+langchain==0.3.25
 openai==1.77.0
+re
