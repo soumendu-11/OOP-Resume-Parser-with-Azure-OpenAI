@@ -1,44 +1,57 @@
-"""
-Resume Parsing Framework using Azure OpenAI GPT-4o
-Optimized for long PDFs with chunking + fallback base64 image extraction
-"""
-
 # =========================
 # Imports
 # =========================
 import os
+import time
 import json
 import re
-import time
 import base64
-import fitz
+import fitz  # PyMuPDF
 import docx
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import HumanMessage
+from openai import AzureOpenAI  # Azure OpenAI SDK
 
 # =========================
-# Azure Configuration
+# Load environment variables
 # =========================
 load_dotenv()
 
 azure_api_key = os.getenv('AZURE_API_KEY')
 azure_endpoint = os.getenv('AZURE_ENDPOINT')
-deployment_name = os.getenv('DEPLOYMENT_NAME')  # GPT-4o deployment
+deployment_name = os.getenv('DEPLOYMENT_NAME')
 api_version = os.getenv('API_VERSION')
 
-if not all([azure_api_key, azure_endpoint, deployment_name, api_version]):
-    raise EnvironmentError("Missing required Azure OpenAI environment variables.")
+required_vars = {
+    'AZURE_API_KEY': azure_api_key,
+    'AZURE_ENDPOINT': azure_endpoint,
+    'DEPLOYMENT_NAME': deployment_name,
+    'API_VERSION': api_version
+}
 
-client = AzureOpenAI(
-    azure_endpoint=azure_endpoint,
-    api_key=azure_api_key,
-    api_version=api_version
-)
+missing_vars = [var for var, value in required_vars.items() if not value]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {missing_vars}")
+
+print("✅ Azure OpenAI Configuration Loaded")
 
 # =========================
-# Prompts
+# CV Parser Prompt (Markdown)
+# =========================
+CV_PARSER_PROMPT = """
+You are an expert CV parser. Your task is to extract all structured information from the given CV text.
+Follow these instructions carefully:
+
+1. Extract all visible text from the CV.
+2. Maintain the correct markdown format.
+3. If there are any tables, convert them into proper markdown table format using pipes `|` and dashes `-`.
+4. Preserve all information, but do not hallucinate or guess missing data.
+5. Output your response exactly in the sections below.
+"""
+
+# =========================
+# Resume JSON Extraction Prompt
 # =========================
 EXTRACTION_PROMPT = """
 You are an expert resume parser.
@@ -51,144 +64,128 @@ Extract ONLY the following fields from the resume text and return a valid JSON o
 }
 
 Rules:
-- "name" should be the person's full name.
+- "name" should be the person's full name (if multiple found, choose the most likely).
 - "email" should be a valid email address.
-- "skills" should be a list of key skills.
+- "skills" should be a list of key skills (technical or soft skills).
 - Do not add any explanations or extra text — only return pure JSON.
 """
 
 # =========================
-# Abstract Base Classes
+# Functions
 # =========================
-class FileParser(ABC):
-    @abstractmethod
-    def extract_text(self, file_path: str) -> str:
-        pass
 
-# =========================
-# Concrete File Parsers
-# =========================
-class PDFParser(FileParser):
-    def extract_text(self, file_path: str) -> str:
-        """Extract all text from PDF pages; fallback to base64 image OCR if empty"""
-        doc = fitz.open(file_path)
-        full_text = ""
-        for i in range(len(doc)):
-            page = doc.load_page(i)
-            text = page.get_text().strip()
-            if not text:
-                # fallback base64 image extraction
-                text = self.extract_text_from_image(file_path, i)
-            full_text += text + "\n"
-        doc.close()
-        return full_text.strip()
+def pdf_page_to_base64(pdf_path, page_num, zoom=5, max_zoom=8, target_width=2500):
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_num)
+    rect = page.rect
+    width, height = rect.width, rect.height
+    scale_factor = target_width / max(width, height)
+    adaptive_zoom = min(max_zoom, max(zoom, scale_factor))
+    mat = fitz.Matrix(adaptive_zoom, adaptive_zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    base64_img = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+    doc.close()
+    return base64_img
 
-    def extract_text_from_image(self, pdf_path, page_num, zoom=2, target_width=1200):
-        """Fallback: Convert PDF page to base64 image and run GPT-4o"""
+def extract_text_fallback_pdf(pdf_path, page_num):
+    try:
         doc = fitz.open(pdf_path)
-        page = doc.load_page(page_num)
-        rect = page.rect
-        scale_factor = target_width / max(rect.width, rect.height)
-        adaptive_zoom = max(zoom, scale_factor)
-        mat = fitz.Matrix(adaptive_zoom, adaptive_zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes("png")
-        base64_img = base64.b64encode(img_bytes).decode("utf-8")
+        text = doc.load_page(page_num).get_text()
+        doc.close()
+        return text
+    except Exception as e:
+        return f"[FALLBACK ERROR: {str(e)}]"
+
+def extract_text_docx(docx_path):
+    try:
+        doc = docx.Document(docx_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    except Exception as e:
+        return f"[ERROR READING DOCX: {str(e)}]"
+
+def process_file(file_path):
+    file_ext = os.path.splitext(file_path)[1].lower()
+    full_content = []
+
+    llm = AzureChatOpenAI(
+        deployment_name=deployment_name,
+        openai_api_version=api_version,
+        openai_api_key=azure_api_key,
+        azure_endpoint=azure_endpoint,
+        temperature=0
+    )
+
+    if file_ext == ".pdf":
+        doc = fitz.open(file_path)
+        for page_num in range(len(doc)):
+            print(f"Processing {os.path.basename(file_path)} - Page {page_num+1}/{len(doc)}...")
+            page_text = extract_text_fallback_pdf(file_path, page_num)
+            response = llm([HumanMessage(content=CV_PARSER_PROMPT + "\n\n" + page_text)])
+            page_content = response.content.strip() if response.content else "[ERROR: Empty GPT response]"
+            full_content.append({
+                "page": page_num + 1,
+                "content": page_content,
+                "file_name": os.path.splitext(os.path.basename(file_path))[0]
+            })
+            time.sleep(1)
         doc.close()
 
-        return self.run_gpt40_with_base64(base64_img)
+    elif file_ext == ".docx":
+        print(f"Processing DOCX file: {os.path.basename(file_path)}...")
+        docx_text = extract_text_docx(file_path)
+        response = llm([HumanMessage(content=CV_PARSER_PROMPT + "\n\n" + docx_text)])
+        page_content = response.content.strip() if response.content else "[ERROR: Empty GPT response]"
+        full_content.append({
+            "page": 1,
+            "content": page_content,
+            "file_name": os.path.splitext(os.path.basename(file_path))[0]
+        })
 
-    def run_gpt40_with_base64(self, base64_img, retry_count=3):
-        """Send base64 image to GPT-4o for text extraction"""
-        for attempt in range(retry_count):
-            try:
-                response = client.chat.completions.create(
-                    model=deployment_name,
-                    messages=[
-                        {"role": "user", "content": f"[IMAGE BASE64]{base64_img}"}
-                    ],
-                    temperature=0
-                )
-                if response.choices and response.choices[0].message.content:
-                    return response.choices[0].message.content.strip()
-            except Exception as e:
-                print(f"⚠️ Attempt {attempt+1} failed: {e}")
-                time.sleep(1)
-        return "[ERROR: Failed to extract text]"
+    else:
+        print(f"⚠️ Unsupported file type: {file_ext}")
 
-class WordParser(FileParser):
-    def extract_text(self, file_path: str) -> str:
-        doc = docx.Document(file_path)
-        return "\n".join([para.text for para in doc.paragraphs]).strip()
+    return full_content
 
-# =========================
-# ResumeData Data Class
-# =========================
-@dataclass
-class ResumeData:
-    name: str
-    email: str
-    skills: list
+def save_extracted_content(extracted_pages, file_name, output_dir):
+    output_file = os.path.join(output_dir, os.path.splitext(file_name)[0] + ".md")
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"# CV EXTRACTION REPORT\n\n")
+        f.write(f"**Source File:** {file_name}\n\n")
+        f.write(f"**Total Pages:** {len(extracted_pages)}\n\n")
+        f.write(f"**Extraction Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
+        for page_data in extracted_pages:
+            f.write(f"## PAGE {page_data['page']} - {file_name}\n\n---\n\n")
+            f.write(page_data["content"])
+            f.write(f"\n\n[END OF PAGE {page_data['page']}]\n\n---\n\n")
+    return output_file
 
-# =========================
-# Azure-based Field Extractor
-# =========================
-class AzureFieldExtractor:
-    """Uses GPT-4o to extract JSON fields from resume text"""
-    def __init__(self, client, deployment_name):
-        self.client = client
-        self.deployment_name = deployment_name
+# Initialize Azure OpenAI Client for JSON extraction
+client = AzureOpenAI(
+    azure_endpoint=azure_endpoint,
+    api_key=azure_api_key,
+    api_version=api_version
+)
 
-    def extract_json_fields(self, text: str) -> ResumeData:
-        # Chunk text if too long
-        max_chunk_length = 50000  # 50k chars per chunk
-        chunks = [text[i:i+max_chunk_length] for i in range(0, len(text), max_chunk_length)]
-        combined_data = {"name": "", "email": "", "skills": []}
-
-        for chunk in chunks:
-            prompt = EXTRACTION_PROMPT + f"\n\nResume Text:\n{chunk}"
-            response = self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            content = response.choices[0].message.content.strip()
-            match = re.search(r'\{.*\}', content, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(0))
-                    # Merge results
-                    if data.get("name") and not combined_data["name"]:
-                        combined_data["name"] = data["name"]
-                    if data.get("email") and not combined_data["email"]:
-                        combined_data["email"] = data["email"]
-                    if data.get("skills"):
-                        combined_data["skills"].extend([s for s in data["skills"] if s not in combined_data["skills"]])
-                except json.JSONDecodeError:
-                    continue
-
-        return ResumeData(**combined_data)
-
-# =========================
-# ResumeParserFramework
-# =========================
-class ResumeParserFramework:
-    def __init__(self):
-        self.parsers = {
-            ".pdf": PDFParser(),
-            ".docx": WordParser()
-        }
-        self.extractor = AzureFieldExtractor(client, deployment_name)
-
-    def parse_resume(self, file_path: str) -> ResumeData:
-        _, ext = os.path.splitext(file_path)
-        parser = self.parsers.get(ext.lower())
-        if not parser:
-            raise ValueError(f"Unsupported file type: {ext}")
-        text = parser.extract_text(file_path)
-        if not text.strip():
-            raise ValueError(f"Empty text extracted from: {file_path}")
-        return self.extractor.extract_json_fields(text)
+def extract_resume_info(text):
+    try:
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=[
+                {"role": "system", "content": EXTRACTION_PROMPT},
+                {"role": "user", "content": text}
+            ],
+            temperature=0
+        )
+        content = response.choices[0].message.content.strip()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            print("⚠️ Model did not return valid JSON. Attempting fix...")
+            json_text = re.search(r'\{.*\}', content, re.DOTALL)
+            return json.loads(json_text.group(0)) if json_text else {"name": None, "email": None, "skills": []}
+    except Exception as e:
+        print(f"❌ Error extracting info: {e}")
+        return {"name": None, "email": None, "skills": []}
 
 # =========================
 # Main Execution
@@ -198,24 +195,36 @@ if __name__ == "__main__":
     output_dir = "/Users/soumendusekharbhattacharjee/Documents/DATA-SCIENCE/Policy_Reporter/data/Output_data"
     os.makedirs(output_dir, exist_ok=True)
 
-    framework = ResumeParserFramework()
     files = [f for f in os.listdir(input_dir) if f.lower().endswith((".pdf", ".docx"))]
 
     if not files:
-        print("⚠️ No resume files found.")
+        print("⚠️ No PDF or DOCX files found in the input directory.")
     else:
-        print(f"📁 Found {len(files)} resume(s) to process.\n")
-        for i, file in enumerate(files, 1):
-            file_path = os.path.join(input_dir, file)
-            print(f"🚀 [{i}/{len(files)}] Parsing: {file}")
-            try:
-                resume_data = framework.parse_resume(file_path)
-                json_path = os.path.join(output_dir, f"{os.path.splitext(file)[0]}.json")
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(resume_data.__dict__, f, indent=2, ensure_ascii=False)
-                print(f"✅ Saved structured data → {json_path}\n")
-            except Exception as e:
-                print(f"❌ Error parsing {file}: {e}\n")
+        print(f"📁 Found {len(files)} file(s) to process.\n")
 
-        print("🎉 All resumes processed successfully!")
+        for i, file_name in enumerate(files, 1):
+            file_path = os.path.join(input_dir, file_name)
+            print(f"\n🚀 [{i}/{len(files)}] Processing: {file_name}")
+
+            try:
+                # Step 1: Extract Markdown from PDF/DOCX
+                extracted_pages = process_file(file_path)
+                md_file = save_extracted_content(extracted_pages, file_name, output_dir)
+                print(f"💾 Saved Markdown: {md_file}")
+
+                # Step 2: Extract structured JSON info from Markdown
+                with open(md_file, "r", encoding="utf-8") as f:
+                    text = f.read()
+
+                parsed_data = extract_resume_info(text)
+                json_file = os.path.join(output_dir, os.path.splitext(file_name)[0] + ".json")
+                with open(json_file, "w", encoding="utf-8") as f:
+                    json.dump(parsed_data, f, indent=2, ensure_ascii=False)
+
+                print(f"💾 Saved JSON: {json_file}\n")
+
+            except Exception as e:
+                print(f"❌ Critical error processing {file_name}: {e}")
+
+        print("\n🎉 All files processed successfully!")
 
